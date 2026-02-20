@@ -31,6 +31,7 @@ char rxBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 float lastSpeedMph = 0.0f;
 bool speedValid = false;
+String lastSpeedJson = "";
 
 void readSensorAndPublish();
 void processSpeedData(const char* data);
@@ -138,6 +139,7 @@ void readSensorAndPublish() {
 
     if (speedValid && Particle.connected()) {
         Particle.publish("speed_reading", String(lastSpeedMph), PRIVATE);
+        Particle.publish("speed_json", lastSpeedJson, PRIVATE);
     }
 }
 
@@ -148,9 +150,34 @@ void processSpeedData(const char* data) {
     lastSpeedMph = atof(data);
     speedValid = true;
 
+    const char* direction = "stationary";
+    if (lastSpeedMph > 0.0f) {
+        direction = "inbound";
+    }
+    else if (lastSpeedMph < 0.0f) {
+        direction = "outbound";
+    }
+
+    // OPS243 docs show JSON fields like speed/direction/time/tick.
+    char payload[160];
+    unsigned long tick = millis();
+    unsigned long timeSeconds = tick / 1000;
+    snprintf(
+        payload,
+        sizeof(payload),
+        "{\"speed\":%.2f,\"direction\":\"%s\",\"time\":%lu,\"tick\":%lu,\"unit\":\"mph\"}",
+        lastSpeedMph,
+        direction,
+        timeSeconds,
+        tick
+    );
+    lastSpeedJson = String(payload);
+
     Serial.print("Speed: ");
     Serial.print(lastSpeedMph);
     Serial.println(" mph");
+    Serial.print("JSON: ");
+    Serial.println(lastSpeedJson);
 }
 
 void firmwareUpdateHandler(system_event_t event, int param) {
