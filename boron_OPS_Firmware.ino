@@ -3,7 +3,8 @@
 
 #include "Particle.h"
 
-#define SENSOR_BAUD 9600
+#define SENSOR_BAUD_PRIMARY 19200
+#define SENSOR_BAUD_FALLBACK 9600
 #define BUFFER_SIZE 64
 
 SYSTEM_THREAD(ENABLED);
@@ -32,23 +33,98 @@ int bufferIndex = 0;
 float lastSpeedMph = 0.0f;
 bool speedValid = false;
 String lastSpeedJson = "";
+int sensorBaud = SENSOR_BAUD_PRIMARY;
 
+void initSensorUart();
+bool trySensorBaud(int baud);
+void clearSerial1Buffer();
 void readSensorAndPublish();
-void processSpeedData(const char* data);
+bool processSpeedData(const char* data);
 void firmwareUpdateHandler(system_event_t event, int param);
 
 void setup() {
     Serial.begin(9600);
-    Serial1.begin(SENSOR_BAUD);
 
     waitFor(Serial.isConnected, 10000);
     Serial.println("Boron Speed Sensor Receiver Started");
+
+    initSensorUart();
 
     System.on(firmware_update, firmwareUpdateHandler);
 
     Cellular.on();
     Particle.connect();
     stateTime = millis();
+}
+
+void initSensorUart() {
+    if (trySensorBaud(SENSOR_BAUD_PRIMARY)) {
+        sensorBaud = SENSOR_BAUD_PRIMARY;
+        return;
+    }
+
+    if (trySensorBaud(SENSOR_BAUD_FALLBACK)) {
+        sensorBaud = SENSOR_BAUD_FALLBACK;
+        return;
+    }
+
+    // Fallback if no response was detected.
+    sensorBaud = SENSOR_BAUD_PRIMARY;
+    Serial1.begin(sensorBaud);
+    Serial.println("Sensor baud auto-detect failed; defaulting to 19200");
+}
+
+bool trySensorBaud(int baud) {
+    Serial1.end();
+    delay(50);
+    Serial1.begin(baud);
+    delay(150);
+    clearSerial1Buffer();
+
+    // Query current interface settings (AN-014-C: I? command).
+    Serial1.print("I?\r\n");
+
+    unsigned long start = millis();
+    char line[BUFFER_SIZE];
+    int idx = 0;
+
+    while (millis() - start < 900) {
+        while (Serial1.available()) {
+            char c = (char)Serial1.read();
+            if (c == '\n') {
+                line[idx] = '\0';
+                if (idx > 0) {
+                    Serial.print("Sensor init response @");
+                    Serial.print(baud);
+                    Serial.print(": ");
+                    Serial.println(line);
+                    return true;
+                }
+                idx = 0;
+            }
+            else if (c != '\r') {
+                if (idx < BUFFER_SIZE - 1) {
+                    line[idx++] = c;
+                }
+            }
+        }
+        delay(10);
+    }
+
+    // Some configs stream data without an I? response; treat any bytes as valid.
+    if (Serial1.available()) {
+        Serial.print("Sensor data detected @");
+        Serial.println(baud);
+        return true;
+    }
+
+    return false;
+}
+
+void clearSerial1Buffer() {
+    while (Serial1.available()) {
+        (void)Serial1.read();
+    }
 }
 
 void loop() {
@@ -118,6 +194,7 @@ void readSensorAndPublish() {
     // Read UART for a short window and process one or more complete lines.
     const unsigned long readWindowMs = 2000;
     unsigned long readStart = millis();
+    bool newSpeedThisCycle = false;
 
     while (millis() - readStart < readWindowMs) {
         while (Serial1.available()) {
@@ -125,7 +202,9 @@ void readSensorAndPublish() {
 
             if (inChar == '\n') {
                 rxBuffer[bufferIndex] = '\0';
-                processSpeedData(rxBuffer);
+                if (processSpeedData(rxBuffer)) {
+                    newSpeedThisCycle = true;
+                }
                 bufferIndex = 0;
             }
             else if (inChar != '\r') {
@@ -137,17 +216,24 @@ void readSensorAndPublish() {
         delay(10);
     }
 
-    if (speedValid && Particle.connected()) {
+    if (newSpeedThisCycle && speedValid && Particle.connected()) {
         Particle.publish("speed_reading", String(lastSpeedMph), PRIVATE);
         Particle.publish("speed_json", lastSpeedJson, PRIVATE);
     }
 }
 
-void processSpeedData(const char* data) {
+bool processSpeedData(const char* data) {
     Serial.print("Received: ");
     Serial.println(data);
 
-    lastSpeedMph = atof(data);
+    char *endPtr = nullptr;
+    float parsed = strtof(data, &endPtr);
+    if (endPtr == data) {
+        // Non-numeric line (for example: config/command response), ignore.
+        return false;
+    }
+
+    lastSpeedMph = parsed;
     speedValid = true;
 
     const char* direction = "stationary";
@@ -178,6 +264,8 @@ void processSpeedData(const char* data) {
     Serial.println(" mph");
     Serial.print("JSON: ");
     Serial.println(lastSpeedJson);
+
+    return true;
 }
 
 void firmwareUpdateHandler(system_event_t event, int param) {
