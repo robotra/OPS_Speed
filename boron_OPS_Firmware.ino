@@ -2,26 +2,34 @@
 // Receives speed data via Serial1 (hardware UART)
 
 #include "Particle.h"
+#include <stdio.h>
 
 #define SENSOR_BAUD_PRIMARY 19200
 #define SENSOR_BAUD_FALLBACK 9600
 #define BUFFER_SIZE 64
+#define MAX_EVENTS 20
 
 SYSTEM_THREAD(ENABLED);
 SYSTEM_MODE(SEMI_AUTOMATIC);
 
 // Connection/sleep behavior copied from fogsensor state-machine approach
 const std::chrono::milliseconds connectMaxTime = 6min;
-const std::chrono::milliseconds cloudMinTime = 10s;
+const std::chrono::milliseconds collectDuration = 1min;
 const std::chrono::seconds sleepTime = 5min;
 const std::chrono::milliseconds firmwareUpdateMaxTime = 2min;
 
 enum State {
     STATE_WAIT_CONNECTED = 0,
+    STATE_COLLECT,
     STATE_PUBLISH,
-    STATE_PRE_SLEEP,
     STATE_SLEEP,
     STATE_FIRMWARE_UPDATE
+};
+
+struct SpeedEvent {
+    unsigned long tickMs;
+    time_t unixTime;
+    float speedMph;
 };
 
 State state = STATE_WAIT_CONNECTED;
@@ -30,16 +38,19 @@ bool firmwareUpdateInProgress = false;
 
 char rxBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
-float lastSpeedMph = 0.0f;
-bool speedValid = false;
-String lastSpeedJson = "";
+SpeedEvent events[MAX_EVENTS];
+size_t eventCount = 0;
+size_t droppedEventCount = 0;
+unsigned long collectStartMs = 0;
 int sensorBaud = SENSOR_BAUD_PRIMARY;
 
 void initSensorUart();
 bool trySensorBaud(int baud);
 void clearSerial1Buffer();
-void readSensorAndPublish();
-bool processSpeedData(const char* data);
+void collectSensorData();
+bool parseSpeedData(const char* data, float &speedOut);
+String buildBatchJson();
+void resetCollectionWindow();
 void firmwareUpdateHandler(system_event_t event, int param);
 
 void setup() {
@@ -132,7 +143,8 @@ void loop() {
     case STATE_WAIT_CONNECTED:
         if (Particle.connected()) {
             Log.info("connected to the cloud in %lu ms", millis() - stateTime);
-            state = STATE_PUBLISH;
+            resetCollectionWindow();
+            state = STATE_COLLECT;
             stateTime = millis();
         }
         else if (millis() - stateTime >= connectMaxTime.count()) {
@@ -141,20 +153,22 @@ void loop() {
         }
         break;
 
-    case STATE_PUBLISH:
-        readSensorAndPublish();
-
-        if (millis() - stateTime < cloudMinTime.count()) {
-            Log.info("waiting %lu ms before sleeping", cloudMinTime.count() - (millis() - stateTime));
-            state = STATE_PRE_SLEEP;
-        }
-        else {
-            state = STATE_SLEEP;
+    case STATE_COLLECT:
+        collectSensorData();
+        if (millis() - collectStartMs >= collectDuration.count()) {
+            state = STATE_PUBLISH;
         }
         break;
 
-    case STATE_PRE_SLEEP:
-        if (millis() - stateTime >= cloudMinTime.count()) {
+    case STATE_PUBLISH:
+        if (Particle.connected()) {
+            String payload = buildBatchJson();
+            Particle.publish("speed_batch_json", payload, PRIVATE);
+            Log.info("published %u events (%u dropped)", (unsigned)eventCount, (unsigned)droppedEventCount);
+            state = STATE_SLEEP;
+        }
+        else {
+            Log.info("cloud disconnected before publish, skipping upload");
             state = STATE_SLEEP;
         }
         break;
@@ -190,39 +204,35 @@ void loop() {
     }
 }
 
-void readSensorAndPublish() {
-    // Read UART for a short window and process one or more complete lines.
-    const unsigned long readWindowMs = 2000;
-    unsigned long readStart = millis();
-    bool newSpeedThisCycle = false;
+void collectSensorData() {
+    while (Serial1.available()) {
+        char inChar = Serial1.read();
 
-    while (millis() - readStart < readWindowMs) {
-        while (Serial1.available()) {
-            char inChar = Serial1.read();
-
-            if (inChar == '\n') {
-                rxBuffer[bufferIndex] = '\0';
-                if (processSpeedData(rxBuffer)) {
-                    newSpeedThisCycle = true;
+        if (inChar == '\n') {
+            rxBuffer[bufferIndex] = '\0';
+            float speed = 0.0f;
+            if (parseSpeedData(rxBuffer, speed)) {
+                if (eventCount < MAX_EVENTS) {
+                    SpeedEvent &evt = events[eventCount++];
+                    evt.tickMs = millis();
+                    evt.unixTime = Time.isValid() ? Time.now() : 0;
+                    evt.speedMph = speed;
                 }
-                bufferIndex = 0;
+                else {
+                    droppedEventCount++;
+                }
             }
-            else if (inChar != '\r') {
-                if (bufferIndex < BUFFER_SIZE - 1) {
-                    rxBuffer[bufferIndex++] = inChar;
-                }
+            bufferIndex = 0;
+        }
+        else if (inChar != '\r') {
+            if (bufferIndex < BUFFER_SIZE - 1) {
+                rxBuffer[bufferIndex++] = inChar;
             }
         }
-        delay(10);
-    }
-
-    if (newSpeedThisCycle && speedValid && Particle.connected()) {
-        Particle.publish("speed_reading", String(lastSpeedMph), PRIVATE);
-        Particle.publish("speed_json", lastSpeedJson, PRIVATE);
     }
 }
 
-bool processSpeedData(const char* data) {
+bool parseSpeedData(const char* data, float &speedOut) {
     Serial.print("Received: ");
     Serial.println(data);
 
@@ -233,39 +243,44 @@ bool processSpeedData(const char* data) {
         return false;
     }
 
-    lastSpeedMph = parsed;
-    speedValid = true;
-
-    const char* direction = "stationary";
-    if (lastSpeedMph > 0.0f) {
-        direction = "inbound";
-    }
-    else if (lastSpeedMph < 0.0f) {
-        direction = "outbound";
-    }
-
-    // OPS243 docs show JSON fields like speed/direction/time/tick.
-    char payload[160];
-    unsigned long tick = millis();
-    unsigned long timeSeconds = tick / 1000;
-    snprintf(
-        payload,
-        sizeof(payload),
-        "{\"speed\":%.2f,\"direction\":\"%s\",\"time\":%lu,\"tick\":%lu,\"unit\":\"mph\"}",
-        lastSpeedMph,
-        direction,
-        timeSeconds,
-        tick
-    );
-    lastSpeedJson = String(payload);
-
-    Serial.print("Speed: ");
-    Serial.print(lastSpeedMph);
-    Serial.println(" mph");
-    Serial.print("JSON: ");
-    Serial.println(lastSpeedJson);
-
+    speedOut = parsed;
     return true;
+}
+
+String buildBatchJson() {
+    String json = "{";
+    json += "\"window_start_tick_ms\":";
+    json += String(collectStartMs);
+    json += ",\"window_duration_ms\":";
+    json += String((unsigned long)collectDuration.count());
+    json += ",\"event_count\":";
+    json += String((unsigned)eventCount);
+    json += ",\"dropped_event_count\":";
+    json += String((unsigned)droppedEventCount);
+    json += ",\"events\":[";
+
+    for (size_t i = 0; i < eventCount; i++) {
+        if (i > 0) {
+            json += ",";
+        }
+        json += "{";
+        json += "\"tick_ms\":";
+        json += String(events[i].tickMs);
+        json += ",\"ts_unix\":";
+        json += String((long)events[i].unixTime);
+        json += ",\"speed_mph\":";
+        json += String(events[i].speedMph, 2);
+        json += "}";
+    }
+    json += "]}";
+    return json;
+}
+
+void resetCollectionWindow() {
+    eventCount = 0;
+    droppedEventCount = 0;
+    collectStartMs = millis();
+    bufferIndex = 0;
 }
 
 void firmwareUpdateHandler(system_event_t event, int param) {
